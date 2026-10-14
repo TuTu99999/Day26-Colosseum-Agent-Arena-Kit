@@ -85,7 +85,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -113,6 +113,64 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import cheap_mask, is_catalog_trap, pick_replica, successor_of
+
+try:
+    from kit.mcp.specs import TOOL_SPECS, cost as _tool_cost
+    _SPECS_AVAILABLE = True
+except ImportError:  # pragma: no cover - collaborator file
+    TOOL_SPECS = {}
+    _SPECS_AVAILABLE = False
+
+    def _tool_cost(
+        server: str,
+        tool: str,
+        fields: tuple[str, ...] = (),
+        n_rows: int = 1,
+    ) -> int:
+        return 5
+
+
+A2A_SERVERS: frozenset[str] = frozenset(
+    {"curriculum-analyst", "citation-checker", "roster"}
+)
+
+# These are the state-changing calls exposed by the kit.  Two are present in
+# kit.mcp.servers but intentionally absent from the smaller public price table,
+# so the gateway keeps the complete enforcement set locally.
+WRITE_TOOLS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("content", "file_content_bug"),
+        ("content", "flag_stale_slide"),
+        ("progress", "record_mastery"),
+        ("registry", "pin"),
+    }
+)
+
+# A catalog's default mask is deliberately its full dump.  These are the
+# smallest useful discovery masks and avoid turning a harmless DISCOVER into
+# a whole-round bill.
+CATALOG_MASKS: Mapping[tuple[str, str], tuple[str, ...]] = {
+    ("registry", "list_servers"): ("name",),
+    ("glossary", "list_terms"): ("term",),
+}
+
+# Credits are more valuable late in a duel.  This is a per-call ceiling, not a
+# per-round call quota: a normal locate/read/corroborate plan must still fit.
+ROUND_CALL_ALLOWANCE: Mapping[int, int] = {
+    1: 8, 2: 8, 3: 8, 4: 9, 5: 9, 6: 9, 7: 10, 8: 11, 9: 11, 10: 12,
+}
+
+_INJECTION_MARKERS: tuple[str, ...] = (
+    "ignore previous instruction",
+    "ignore all previous",
+    "disregard the above",
+    "system override",
+    "you must now",
+    "also record this for",
+    "reveal the",
+    "bỏ qua mọi hướng dẫn",
+)
 
 __all__ = [
     "COMMAND_KINDS",
@@ -333,23 +391,13 @@ class Gateway:
     def __init__(self, ctx: GatewayContext) -> None:
         self.ctx = ctx
         self._telemetry = Telemetry(ctx)
-
-        # --- per-duel memory, unused by the naive starter below ---------
-        # A cache of anchor -> body-ish data you have already paid for this
-        # duel (agent/strategy.py's ResultCache is a ready-made version of
-        # this). Populating it needs the *result* of a call, which decide()
-        # never sees (it only sees the outgoing Command) — you would fill
-        # this from whatever the arena hands back to your agent loop AFTER
-        # a call executes, then consult it here on the NEXT decide() call
-        # for the same anchor.
         self._seen_anchors: dict[str, Any] = {}
-        # Credits you have personally authorised so far this duel — your
-        # own running total, independent of (and a cross-check against)
-        # `ctx.credits`, which the arena maintains authoritatively.
         self._credits_authorised: int = 0
-        # Command ids you have already denied, in case a later job wants to
-        # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        self._admitted_cards: dict[str, dict[str, Any]] = {}
+        self._etags: dict[str, str] = {}
+        self._used_idempotency_keys: set[str] = set()
+        self._rate_calls: dict[tuple[str, str], list[int]] = {}
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
@@ -361,71 +409,286 @@ class Gateway:
         check" against something external looks. Everything you need to
         decide is already sitting in `cmd` and `self.ctx`.
 
-        This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
-        self._telemetry.decision_seen(cmd)
+        The implementation is deliberately fail-closed for commands that are
+        provably unsafe or doomed, and fail-open for unfamiliar read-only tools.
+        That balance matters: blanket denial loses on clean blank cards."""
+        try:
+            self._telemetry.decision_seen(cmd)
 
-        # ------------------------------------------------------------------
-        # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+            # JOB 1 — ROUTE.  A body-selected route is precisely the
+            # header_spoof/replica_flip shape: do not legitimise it by copying
+            # it into a trusted header.  Ordinary MCP calls are pinned through
+            # the header using the strategy helper.
+            if any(cmd.args.get(k) not in (None, "") for k in ("route", "_route", "replica")):
+                return self.deny(cmd, "route declared in the body, not the trusted header")
 
-        # ------------------------------------------------------------------
-        # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+            routed = self._route(cmd)
 
-        # ------------------------------------------------------------------
-        # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+            # JOB 2 — ADMIT.  Validate the A2A identity envelope, reject
+            # mutation markers visible in the command, and avoid charged calls
+            # that cannot possibly succeed.
+            admission_error, quarantine = self._admission_error(routed)
+            if admission_error:
+                return self.deny(cmd, admission_error, quarantine=quarantine)
 
-        # ------------------------------------------------------------------
-        # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+            # JOB 3 — AUTHORIZE.  Authority is derived from ctx.act and
+            # ctx.scopes, never from the tutor's powerful ctx.sub identity.
+            authorization_error = self._authorization_error(routed)
+            if authorization_error:
+                return self.deny(cmd, authorization_error)
 
-        call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
-        self._telemetry.decision_made(cmd, decision)
-        return decision
+            # JOB 4 — BUDGET.  Make masks explicit, replace punishment-button
+            # masks with narrow useful ones, and refuse only when even the
+            # narrow form cannot fit the live credit/round allowance.
+            budgeted, budget_error = self._budget(routed)
+            if budget_error:
+                return self.deny(cmd, budget_error)
 
-    def deny(self, cmd: Command, reason: str) -> Decision:
+            call = self._to_tool_call(budgeted)
+            changed = budgeted != cmd
+            decision = Decision(
+                verdict="rewrite" if changed else "forward",
+                call=call,
+                note="gateway policy rewrite" if changed else None,
+            )
+            self._record_authorised(budgeted)
+            self._telemetry.decision_made(cmd, decision)
+            return decision
+        except Exception as exc:
+            # decide() raising is itself a scored integrity failure.  A malformed
+            # or future command must therefore degrade to a valid, free denial.
+            return self.deny(cmd, f"gateway policy could not safely classify command: {type(exc).__name__}")
+
+    def _route(self, cmd: Command) -> Command:
+        server, tool = cmd.server, cmd.tool
+        successor = successor_of(server, tool)
+        if successor is not None:
+            server, tool = successor
+
+        headers = {str(k).lower(): v for k, v in cmd.headers.items()}
+        headers.pop("x-mcp-body-route", None)
+        if server not in A2A_SERVERS:
+            path_id = self._path_id(cmd.args)
+            known_drifting = bool(
+                cmd.args.get("known_drifting") or cmd.args.get("drifts")
+            )
+            fresher = cmd.args.get("fresher")
+            choice = pick_replica(
+                path_id=path_id,
+                known_drifting=known_drifting,
+                # A drift flag proves disagreement, not that canonical is
+                # newer (day18 is the counterexample).  Stay on working
+                # unless provenance/current_version_of supplied `fresher`.
+                prefers_fresh=False,
+            )
+            replica = fresher if fresher in ("w", "c") else choice.replica
+            headers["mcp-replica"] = replica
+
+        key = (server, tool)
+        spec = TOOL_SPECS.get(key) if _SPECS_AVAILABLE else None
+        if key in WRITE_TOOLS or bool(getattr(spec, "is_write", False)):
+            anchor = str(cmd.args.get("anchor") or cmd.args.get("learner") or "")
+            if not headers.get("if-match") and anchor in self._etags:
+                headers["if-match"] = self._etags[anchor]
+            if not headers.get("idempotency-key") and headers.get("if-match"):
+                headers["idempotency-key"] = cmd.cmd_id
+
+        return replace(cmd, server=server, tool=tool, headers=headers)
+
+    @staticmethod
+    def _path_id(args: Mapping[str, Any]) -> str | None:
+        direct = args.get("path_id")
+        if isinstance(direct, str) and direct:
+            return direct
+        for key in ("anchor", "concept"):
+            raw = args.get(key)
+            if not isinstance(raw, str) or ":" not in raw:
+                continue
+            tail = raw.split(":", 1)[1]
+            slug = tail.split("/", 1)[0]
+            if slug:
+                return slug
+        return None
+
+    def _admission_error(self, cmd: Command) -> tuple[str | None, bool]:
+        headers = {str(k).lower(): v for k, v in cmd.headers.items()}
+
+        if str(headers.get("x-server-fingerprint", "")).lower() in {
+            "invalid", "untrusted", "unvouched", "forged",
+        }:
+            return "server identity is not vouched for", False
+        if str(headers.get("x-card-signature", "")).lower() in {
+            "invalid", "untrusted", "unvouched", "forged",
+        }:
+            return "peer Agent Card signature is invalid", False
+        if cmd.args.get("peer_unverified") is True:
+            return "peer result is explicitly unverified", False
+
+        blob = " ".join(str(v) for v in cmd.args.values()).lower()
+        if any(marker in blob for marker in _INJECTION_MARKERS):
+            return "instruction-shaped content was quarantined", True
+        catalog = cmd.args.get("catalog")
+        if isinstance(catalog, (str, bytes, list, tuple, dict)) and len(catalog) > 512:
+            return "inflated catalog rejected before it consumed the context budget", False
+
+        if cmd.server in A2A_SERVERS:
+            card = self._admitted_cards.get(cmd.server)
+            if not card or not card.get("verified"):
+                return "peer Agent Card was not admitted by the registry", False
+            if cmd.tool not in set(card.get("skills") or ()):
+                return "requested skill is not declared on the admitted Agent Card", False
+            aud = headers.get("aud")
+            if aud not in (cmd.server, f"a2a:{cmd.server}", f"mcp:{cmd.server}"):
+                return "delegation audience does not match the peer being called", False
+
+        spec = TOOL_SPECS.get((cmd.server, cmd.tool)) if _SPECS_AVAILABLE else None
+        needs_lease = bool(getattr(spec, "needs_lease", False)) or (
+            cmd.server, cmd.tool
+        ) == ("slides", "get_frame")
+        if needs_lease:
+            live = set(getattr(self.ctx, "leases", ()) or ())
+            if not cmd.lease_id or cmd.lease_id not in live:
+                return "slides.get_frame requires a live lease from this exchange", False
+
+        if self._unchanged_conflict_in_history(cmd):
+            return "unchanged retry after a write conflict requires fresh provenance", False
+        if self._rate_limited(cmd):
+            return "tool rate window is exhausted; a charged failure was avoided", False
+        return None, False
+
+    def _authorization_error(self, cmd: Command) -> str | None:
+        act = str(getattr(self.ctx, "act", "") or "")
+        for key in ("learner", "learner_id", "act", "target", "subject"):
+            target = cmd.args.get(key)
+            if not isinstance(target, str) or not target:
+                continue
+            if key in {"target", "subject"} and "learner:" not in target.lower():
+                continue
+            if target.lower() != act.lower():
+                return f"target {target!r} is not owned by ctx.act={act!r}"
+
+        key = (cmd.server, cmd.tool)
+        spec = TOOL_SPECS.get(key) if _SPECS_AVAILABLE else None
+        is_write = key in WRITE_TOOLS or bool(getattr(spec, "is_write", False))
+        if not is_write:
+            return None
+
+        required_scope = f"wiki.write:{cmd.server}"
+        scopes = set(getattr(self.ctx, "scopes", ()) or ())
+        if required_scope not in scopes:
+            return f"write requires missing scope {required_scope!r}"
+
+        headers = {str(k).lower(): v for k, v in cmd.headers.items()}
+        if not headers.get("if-match") or not headers.get("idempotency-key"):
+            return "write requires a fresh If-Match etag and Idempotency-Key"
+        if str(headers["idempotency-key"]) in self._used_idempotency_keys:
+            return "Idempotency-Key was already used this duel"
+        return None
+
+    def _budget(self, cmd: Command) -> tuple[Command, str | None]:
+        key = (cmd.server, cmd.tool)
+        spec = TOOL_SPECS.get(key) if _SPECS_AVAILABLE else None
+        requested = tuple(cmd.fields)
+
+        if key in CATALOG_MASKS and is_catalog_trap(cmd.server, cmd.tool, requested):
+            fields = cheap_mask(cmd.server, cmd.tool, CATALOG_MASKS[key])
+        elif spec is not None:
+            if requested == ("*",):
+                fields = tuple(spec.default_fields)
+            elif not requested:
+                fields = tuple(spec.default_fields)
+            else:
+                valid = tuple(f for f in requested if f in spec.all_fields)
+                fields = cheap_mask(cmd.server, cmd.tool, valid or tuple(spec.default_fields))
+        else:
+            fields = requested
+
+        candidate = replace(cmd, fields=fields)
+        cost = self._estimate_cost(candidate)
+        allowance = ROUND_CALL_ALLOWANCE.get(int(getattr(self.ctx, "round", 0) or 0), 9)
+
+        if cost > allowance and spec is not None:
+            narrower = CATALOG_MASKS.get(key, tuple(spec.default_fields))
+            candidate = replace(candidate, fields=tuple(narrower))
+            cost = self._estimate_cost(candidate)
+
+        credits = int(getattr(self.ctx, "credits", 0) or 0)
+        if cost > credits:
+            return candidate, f"call costs {cost} credits but only {credits} remain"
+        if cost > allowance:
+            return candidate, f"call costs {cost} credits, above round-{getattr(self.ctx, 'round', 0)} allowance {allowance}"
+        return candidate, None
+
+    @staticmethod
+    def _estimate_cost(cmd: Command) -> int:
+        if not _SPECS_AVAILABLE or (cmd.server, cmd.tool) not in TOOL_SPECS:
+            return 5
+        return _tool_cost(cmd.server, cmd.tool, fields=tuple(cmd.fields), n_rows=1)
+
+    def _rate_limited(self, cmd: Command) -> bool:
+        spec = TOOL_SPECS.get((cmd.server, cmd.tool)) if _SPECS_AVAILABLE else None
+        window = getattr(spec, "rate_limit", None)
+        if window is None:
+            return False
+        allowed, per_rounds = window
+        current = int(getattr(self.ctx, "round", 0) or 0)
+        recent = [r for r in self._rate_calls.get((cmd.server, cmd.tool), []) if current - r < per_rounds]
+        self._rate_calls[(cmd.server, cmd.tool)] = recent
+        return len(recent) >= allowed
+
+    def _record_authorised(self, cmd: Command) -> None:
+        cost = self._estimate_cost(cmd)
+        self._credits_authorised += cost
+        spec = TOOL_SPECS.get((cmd.server, cmd.tool)) if _SPECS_AVAILABLE else None
+        if getattr(spec, "rate_limit", None) is not None:
+            self._rate_calls.setdefault((cmd.server, cmd.tool), []).append(
+                int(getattr(self.ctx, "round", 0) or 0)
+            )
+        key = (cmd.server, cmd.tool)
+        if key in WRITE_TOOLS or bool(getattr(spec, "is_write", False)):
+            idem = {str(k).lower(): v for k, v in cmd.headers.items()}.get("idempotency-key")
+            if idem:
+                self._used_idempotency_keys.add(str(idem))
+
+    @staticmethod
+    def _command_signature(value: Any) -> tuple[Any, ...] | None:
+        if isinstance(value, Command):
+            return value.server, value.tool, repr(sorted(value.args.items())), tuple(value.fields)
+        if isinstance(value, Mapping):
+            server, tool = value.get("server"), value.get("tool")
+            if not isinstance(server, str) or not isinstance(tool, str):
+                return None
+            args = value.get("args") if isinstance(value.get("args"), Mapping) else {}
+            fields = value.get("fields") or ()
+            return server, tool, repr(sorted(args.items())), tuple(fields)
+        return None
+
+    def _unchanged_conflict_in_history(self, cmd: Command) -> bool:
+        wanted = self._command_signature(cmd)
+        for item in getattr(self.ctx, "history", ()) or ():
+            if not isinstance(item, Mapping):
+                continue
+            prior = item.get("command") or item.get("cmd")
+            result = item.get("result") or item.get("outcome") or {}
+            error = result.get("error") if isinstance(result, Mapping) else None
+            code = error.get("code") if isinstance(error, Mapping) else None
+            if code in {"conflict", "precondition_missing"} and self._command_signature(prior) == wanted:
+                return True
+        return False
+
+    def note_card(self, server: str, card: Mapping[str, Any]) -> None:
+        """Record an Agent Card already verified by the trusted registry path."""
+        self._admitted_cards[str(server)] = dict(card)
+
+    def note_provenance(self, anchor: str, etag: str) -> None:
+        """Record the latest etag returned after a successful provenance read."""
+        if anchor and etag:
+            self._etags[str(anchor)] = str(etag)
+
+    # Operator and existing harnesses use this older callback spelling.
+    note_result = note_provenance
+
+    def deny(self, cmd: Command, reason: str, *, quarantine: bool = False) -> Decision:
         """Not called anywhere in this starter's `decide()` — a ready-made
         helper for when you fill in JOB 2 / JOB 3 above, so denying doesn't
         mean hand-building a `Decision` inline at every call site. Kept as
@@ -433,8 +696,11 @@ class Gateway:
         no `call`, a non-empty `reason` — is exactly the thing worth
         getting right by construction rather than by convention."""
         self._denied_cmd_ids.add(cmd.cmd_id)
-        decision = Decision(verdict="deny", reason=reason)
-        self._telemetry.decision_made(cmd, decision)
+        decision = Decision(verdict="deny", reason=reason, quarantine=quarantine)
+        try:
+            self._telemetry.decision_made(cmd, decision)
+        except Exception:
+            pass
         return decision
 
     def _to_tool_call(self, cmd: Command) -> "ToolCall":
@@ -508,7 +774,8 @@ if __name__ == "__main__":
         raw_actions = [
             "MCP registry.provenance anchor=Frame:3f2a9c11/w/041 fields=etag",
             'MCP slides.query q="streamable http replaces http+sse" fields=title,body',
-            "A2A curriculum-analyst.which_days_cover concept=Concept:streamable-http fields=anchor,course_day,track",
+            "A2A curriculum-analyst.which_days_cover concept=Concept:streamable-http "
+            "fields=anchor,course_day,track header.aud=curriculum-analyst",
             "DISCOVER registry.list_servers fields=name",
         ]
         demo_commands = []
@@ -529,7 +796,7 @@ if __name__ == "__main__":
         else:
             raise AssertionError("expected ValueError for an 'answer' action")
 
-    print("\n=== Gateway.decide — the naive starter forwards everything ===\n")
+    print("\n=== Gateway.decide — route/admit/authorize/budget policy ===\n")
     ctx = RecordingGatewayContext(
         act="learner:sv-0401",
         sub="agent:demo-team",
@@ -542,17 +809,20 @@ if __name__ == "__main__":
     )
     assert isinstance(ctx, GatewayContext), "RecordingGatewayContext must structurally satisfy GatewayContext"
     gw = Gateway(ctx)
+    gw.note_card(
+        "curriculum-analyst",
+        {"verified": True, "skills": ["which_days_cover"]},
+    )
     for cmd in demo_commands:
         decision = gw.decide(cmd)
         print(f"  decide({cmd.server}.{cmd.tool}) -> verdict={decision.verdict!r} quarantine={decision.quarantine}")
-        assert decision.verdict == "forward"
+        assert decision.verdict in {"forward", "rewrite"}
         assert decision.call is not None
         call_dict = decision.call.to_dict() if hasattr(decision.call, "to_dict") else decision.call
-        assert call_dict["server"] == cmd.server
-        assert call_dict["tool"] == cmd.tool
-        assert tuple(call_dict["fields"]) == cmd.fields
+        expected = successor_of(cmd.server, cmd.tool) or (cmd.server, cmd.tool)
+        assert (call_dict["server"], call_dict["tool"]) == expected
 
-    print(f"\n=== Gateway.deny — the unused-by-default free-abstention path ===\n")
+    print(f"\n=== Gateway.deny — the free fail-closed path ===\n")
     denial = gw.deny(demo_commands[0], reason="demo: withholding pending a fresher registry.provenance read")
     print(f"  gw.deny(...) -> verdict={denial.verdict!r} reason={denial.reason!r} call={denial.call!r}")
     assert denial.verdict == "deny"
